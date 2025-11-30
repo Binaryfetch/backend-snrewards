@@ -132,7 +132,12 @@ export const getMyInvoices = async (req, res) => {
       match = {};
     } 
     else if (req.user.role === "Distributor") {
-      match = { fromUser: req.user.id };
+      match = {
+        $or: [
+          { fromUser: req.user.id },    // invoices distributor sent to dealers
+          { toUser: req.user.id }       // invoices distributor received from company
+        ]
+      };
     }
     else if (req.user.role === "Dealer") {
       match = { toUser: req.user.id };
