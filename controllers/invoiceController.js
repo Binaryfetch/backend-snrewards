@@ -70,36 +70,53 @@ const fetchRecentInvoices = (match = {}) =>
 const ensureDistributorProductAccess = async (distributorId, items = []) => {
   if (!items.length) return;
 
-  const requirements = items.reduce((acc, item) => {
-    const key = String(item.productID);
-    const qty = Number(item.qty || 0);
-    acc[key] = (acc[key] || 0) + qty;
-    return acc;
-  }, {});
+  // Group items by product and convert all to pieces for validation
+  const requirements = {};
+  const productIds = [...new Set(items.map(item => String(item.productID)))];
 
-  const productIds = Object.keys(requirements);
+  // Fetch all products and allocations
+  const products = await Product.find({ _id: { $in: productIds } });
+  const productMap = new Map(products.map(p => [String(p._id), p]));
 
   const allocations = await UserProductAllocation.find({
     userID: distributorId,
     productID: { $in: productIds }
-  }).select("productID qty");
+  }).select("productID pieces");
 
   const allocationMap = allocations.reduce((map, allocation) => {
-    map.set(allocation.productID.toString(), allocation);
+    map.set(String(allocation.productID), allocation);
     return map;
   }, new Map());
 
-  for (const productId of productIds) {
-    const requiredQty = requirements[productId] || 0;
-    const allocation = allocationMap.get(productId);
-    const availableQty = Number(allocation?.qty || 0);
+  // Calculate total pieces required per product
+  for (const item of items) {
+    const productId = String(item.productID);
+    const product = productMap.get(productId);
+    if (!product) {
+      throw new Error(`Product not found: ${productId}`);
+    }
 
-    if (availableQty < requiredQty) {
-      const error = new Error("Transfer quantity exceeds available stock");
+    const qty = Number(item.qty || 0);
+    const uom = item.uom || "PIECE";
+    const piecesRequired = getPiecesFromUom(product, uom, qty);
+
+    requirements[productId] = (requirements[productId] || 0) + piecesRequired;
+  }
+
+  // Validate stock availability in pieces
+  for (const productId of Object.keys(requirements)) {
+    const requiredPieces = requirements[productId];
+    const allocation = allocationMap.get(productId);
+    const availablePieces = Number(allocation?.pieces || 0);
+
+    if (availablePieces < requiredPieces) {
+      const product = productMap.get(productId);
+      const error = new Error("Stock Not Available");
       error.details = {
         productId,
-        requestedQty: requiredQty,
-        availableQty
+        productName: product?.itemDescription || product?.name,
+        requestedPieces: requiredPieces,
+        availablePieces
       };
       throw error;
     }
@@ -205,22 +222,51 @@ const allocateProducts = async (userID, allocations = []) => {
 };
 
 const releaseAllocatedProducts = async (userID, allocations = []) => {
+  // Group allocations by product and sum pieces
+  const productRequirements = {};
   for (const allocation of allocations) {
+    const productId = String(allocation.productID);
+    productRequirements[productId] = (productRequirements[productId] || 0) + allocation.pieces;
+  }
+
+  // Validate and release stock in pieces
+  for (const productId of Object.keys(productRequirements)) {
+    const requiredPieces = productRequirements[productId];
     const existing = await UserProductAllocation.findOne({
       userID,
-      productID: allocation.productID
+      productID: productId
     });
 
     if (!existing) {
       throw new Error("Allocated inventory not found for the selected product");
     }
 
-    if (existing.qty < allocation.qty) {
-      throw new Error("Insufficient allocated quantity for the selected product");
+    if (existing.pieces < requiredPieces) {
+      throw new Error("Insufficient allocated stock (pieces) for the selected product");
     }
 
-    existing.qty -= allocation.qty;
-    existing.pieces = Math.max(existing.pieces - allocation.pieces, 0);
+    // Decrement pieces
+    existing.pieces = Math.max(existing.pieces - requiredPieces, 0);
+    
+    // Recalculate qty based on pieces and product's salesUom
+    // For now, we'll keep qty in sync by converting pieces back to the original UOM
+    // Since we don't have salesUom in Product, we'll use the allocation's uom
+    const product = await Product.findById(productId);
+    if (product) {
+      if (existing.uom === "BOX" && product.boxQuantity > 0) {
+        existing.qty = Math.floor(existing.pieces / product.boxQuantity);
+      } else if (existing.uom === "CARTON" && product.cartonQuantity > 0) {
+        existing.qty = Math.floor(existing.pieces / product.cartonQuantity);
+      } else if (existing.uom === "DOZEN") {
+        existing.qty = Math.floor(existing.pieces / 12);
+      } else {
+        existing.qty = existing.pieces;
+      }
+    } else {
+      // Fallback: just use pieces as qty
+      existing.qty = existing.pieces;
+    }
+    
     await existing.save();
   }
 };
